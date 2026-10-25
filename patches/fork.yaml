@@ -1,0 +1,39 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/amodm/webbrowser-rs.git
+  fetch_ref: refs/heads/main
+base:
+  target:
+    kind: tag
+    selector: refs/tags/v1.2.5
+    commit: 278ec1b5aeeb07f9fcbda569cb075e58727ba623
+  canonical: 278ec1b5aeeb07f9fcbda569cb075e58727ba623
+  stack: 278ec1b5aeeb07f9fcbda569cb075e58727ba623
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: fork-tooling
+    kind: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []
