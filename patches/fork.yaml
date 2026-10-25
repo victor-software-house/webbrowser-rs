@@ -1,0 +1,65 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/amodm/webbrowser-rs.git
+  fetch_ref: refs/heads/main
+base:
+  target:
+    kind: tag
+    selector: refs/tags/v1.2.5
+    commit: 278ec1b5aeeb07f9fcbda569cb075e58727ba623
+  canonical: 278ec1b5aeeb07f9fcbda569cb075e58727ba623
+  stack: 278ec1b5aeeb07f9fcbda569cb075e58727ba623
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: macos-reveal-and-open-with-app
+    kind: source
+    purpose: >-
+      Reveal a file in the Finder and open a URL with a chosen application on macOS,
+      in process through NSWorkspace, for a-process.
+    upstream_status: not-submitted
+    drop_when: >-
+      Upstream webbrowser ships a file reveal and an open with a chosen application
+      on macOS.
+    scope:
+      - src/lib.rs
+      - src/macos.rs
+      - tests/test_macos.rs
+  - name: macos-open-with-installed-app
+    kind: source
+    purpose: "Find an application by name among every installed application on macOS: the standard application folders first, then Spotlight when the scan finds none, for a-process."
+    upstream_status: not-submitted
+    drop_when: >-
+      Upstream webbrowser ships an open with a chosen application on macOS that finds
+      an installed application by name.
+    scope:
+      - src/lib.rs
+      - src/macos.rs
+      - tests/test_macos.rs
+      - Cargo.toml
+      - docs/**
+  - name: fork-tooling
+    kind: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []

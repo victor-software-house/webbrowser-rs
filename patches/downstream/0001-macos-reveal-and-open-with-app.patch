@@ -1,0 +1,229 @@
+macos-reveal-and-open-with-app
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Reveal a file in the Finder and open a URL with a chosen application on macOS, in process through NSWorkspace, for a-process.
+Upstream-Status: not-submitted
+Drop-When: Upstream webbrowser ships a file reveal and an open with a chosen application on macOS.
+---
+ src/lib.rs          |   54 ++++++++++++++++++++++++++++++++
+ src/macos.rs        |   86 +++++++++++++++++++++++++++++++++++++++++++++++++--
+ tests/test_macos.rs |   28 +++++++++++++++++
+ 3 files changed, 164 insertions(+), 4 deletions(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index a578885..9f93889 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -340,6 +340,60 @@ pub fn open_browser_with_options(
+     }
+ }
+ 
++/// Opens the URL with the application `app`, on macOS only: the path of a `.app` bundle, else a
++/// bundle identifier such as `org.mozilla.firefox`, else the name of one of the applications that
++/// open the URL, such as `Firefox`. A name that two of those applications share is refused with
++/// `ErrorKind::InvalidInput`. Return semantics are otherwise the same as for
++/// [open](fn.open.html).
++///
++/// # Examples
++/// ```no_run
++/// # #[cfg(target_os = "macos")] {
++/// if webbrowser::open_with_app("Firefox", "http://github.com").is_ok() {
++///     // ...
++/// }
++/// # }
++/// ```
++#[cfg(target_os = "macos")]
++pub fn open_with_app(app: &str, url: &str) -> Result<()> {
++    open_with_app_with_options(app, url, &BrowserOptions::default())
++}
++
++/// Opens the URL with the application `app` as [open_with_app](fn.open_with_app.html) does,
++/// while overriding the default options. With `dry_run`, it finds the application and opens
++/// nothing.
++#[cfg(target_os = "macos")]
++pub fn open_with_app_with_options(app: &str, url: &str, options: &BrowserOptions) -> Result<()> {
++    let target = TargetType::try_from(url)?;
++
++    // if feature:hardened is enabled, make sure we accept only HTTP(S) URLs
++    #[cfg(feature = "hardened")]
++    if !target.is_http() {
++        return Err(Error::new(
++            ErrorKind::InvalidInput,
++            "only http/https urls allowed",
++        ));
++    }
++
++    os::open_with_app_internal(app, &target, options)
++}
++
++/// Shows the existing file or folder at `path` selected in a Finder window, on macOS only. A
++/// path that does not exist is refused with `ErrorKind::NotFound`.
++///
++/// # Examples
++/// ```no_run
++/// # #[cfg(target_os = "macos")] {
++/// if webbrowser::reveal(std::path::Path::new("Cargo.toml")).is_ok() {
++///     // ...
++/// }
++/// # }
++/// ```
++#[cfg(target_os = "macos")]
++pub fn reveal(path: &std::path::Path) -> Result<()> {
++    os::reveal_internal(path)
++}
++
+ /// The link we're trying to open, represented as a URL. Local files get represented
+ /// via `file://...` URLs
+ struct TargetType(url::Url);
+diff --git a/src/macos.rs b/src/macos.rs
+index e4dc3b8..c442970 100644
+--- a/src/macos.rs
++++ b/src/macos.rs
+@@ -1,11 +1,11 @@
+ use crate::{Browser, BrowserOptions, Error, ErrorKind, Result, TargetType};
++use objc2::rc::Retained;
+ use objc2_app_kit::{NSWorkspace, NSWorkspaceLaunchOptions};
+ use objc2_foundation::{NSArray, NSDictionary, NSError, NSString, NSURL};
++use std::fmt::Display;
++use std::path::Path;
+ 
+ /// Deal with opening of browsers on macOS using the AppKit `NSWorkspace` APIs.
+-// We intentionally use the deprecated synchronous launch API (see the note at
+-// the launch site below), so silence the deprecation warnings for this fn.
+-#[allow(deprecated)]
+ pub(super) fn open_browser_internal(
+     browser: Browser,
+     target: &TargetType,
+@@ -28,6 +28,84 @@ pub(super) fn open_browser_internal(
+     }
+     .ok_or_else(|| Error::new(ErrorKind::NotFound, "browser not found"))?;
+ 
++    launch(&workspace, &app_url, &browser, target, options)
++}
++
++/// Opens `target` with the application `app`: the path of a `.app` bundle,
++/// else a bundle identifier, else the name of one of the applications that
++/// open `target`. A name that two of those applications share is refused.
++pub(super) fn open_with_app_internal(
++    app: &str,
++    target: &TargetType,
++    options: &BrowserOptions,
++) -> Result<()> {
++    let workspace = NSWorkspace::sharedWorkspace();
++    let app_url = resolve_app(&workspace, app, target)?;
++    launch(&workspace, &app_url, &app, target, options)
++}
++
++/// Shows `path`, an existing file or folder, selected in a Finder window.
++pub(super) fn reveal_internal(path: &Path) -> Result<()> {
++    std::fs::metadata(path)?;
++    let path = path
++        .to_str()
++        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "path is not valid unicode"))?;
++    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
++    NSWorkspace::sharedWorkspace()
++        .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
++    Ok(())
++}
++
++/// The application `app` names, tried in the order [`open_with_app_internal`]
++/// documents.
++fn resolve_app(workspace: &NSWorkspace, app: &str, target: &TargetType) -> Result<Retained<NSURL>> {
++    if app.ends_with(".app") && Path::new(app).is_dir() {
++        return Ok(NSURL::fileURLWithPath(&NSString::from_str(app)));
++    }
++    if let Some(url) = workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(app)) {
++        return Ok(url);
++    }
++    let target_url = NSURL::URLWithString(&NSString::from_str(target.as_ref()))
++        .ok_or_else(|| Error::other("failed to create target NSURL"))?;
++    let bundle = format!("{app}.app");
++    let mut named = workspace
++        .URLsForApplicationsToOpenURL(&target_url)
++        .to_vec()
++        .into_iter()
++        .filter(|url| {
++            url.path().is_some_and(|path| {
++                Path::new(&path.to_string())
++                    .file_name()
++                    .is_some_and(|name| name == bundle.as_str())
++            })
++        });
++    match (named.next(), named.next()) {
++        (Some(url), None) => Ok(url),
++        (None, _) => Err(Error::new(
++            ErrorKind::NotFound,
++            format!("no application {app} opens {target}"),
++        )),
++        (Some(_), Some(_)) => Err(Error::new(
++            ErrorKind::InvalidInput,
++            format!("more than one application is named {app}"),
++        )),
++    }
++}
++
++/// Opens `target` with the application at `app_url`, which `label` names in
++/// logs.
++// We intentionally use the deprecated synchronous launch API (see the note at
++// the launch site below), so silence the deprecation warnings for this fn.
++#[allow(deprecated)]
++fn launch(
++    workspace: &NSWorkspace,
++    app_url: &NSURL,
++    label: &dyn Display,
++    target: &TargetType,
++    options: &BrowserOptions,
++) -> Result<()> {
++    let browser = label;
++
+     // handle dry-run scenario: the application was located above, so we know it
+     // exists without actually launching it.
+     if options.dry_run {
+@@ -59,7 +137,7 @@ pub(super) fn open_browser_internal(
+     let result = unsafe {
+         workspace.openURLs_withApplicationAtURL_options_configuration_error(
+             &urls,
+-            &app_url,
++            app_url,
+             launch_options,
+             &config,
+         )
+diff --git a/tests/test_macos.rs b/tests/test_macos.rs
+index 86966fa..435c3cb 100644
+--- a/tests/test_macos.rs
++++ b/tests/test_macos.rs
+@@ -96,5 +96,33 @@ mod tests {
+         let err = webbrowser::open("file:///etc/passwd")
+             .expect_err("expected non-http url to fail in hardened mode");
+         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
++        let err = webbrowser::open_with_app("Safari", "file:///etc/passwd")
++            .expect_err("expected non-http url to fail in hardened mode");
++        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
++    }
++
++    #[test]
++    fn test_reveal_missing_path() {
++        let err = webbrowser::reveal(std::path::Path::new("/webbrowser-test/no-such-path"))
++            .expect_err("expected a missing path to fail");
++        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
++    }
++
++    #[test]
++    fn test_open_with_missing_app() {
++        let err = webbrowser::open_with_app("webbrowser-test-no-such-app", "https://github.com")
++            .expect_err("expected a missing application to fail");
++        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
++    }
++
++    #[test]
++    fn test_open_with_app_finds_a_path_a_bundle_id_and_a_name() {
++        let mut options = webbrowser::BrowserOptions::new();
++        options.with_dry_run(true);
++        for app in ["/Applications/Safari.app", "com.apple.Safari", "Safari"] {
++            let opened =
++                webbrowser::open_with_app_with_options(app, "https://github.com", &options);
++            assert!(opened.is_ok(), "{app}: {opened:?}");
++        }
+     }
+ }
