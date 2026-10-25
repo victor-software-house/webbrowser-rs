@@ -96,5 +96,33 @@ mod tests {
         let err = webbrowser::open("file:///etc/passwd")
             .expect_err("expected non-http url to fail in hardened mode");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = webbrowser::open_with_app("Safari", "file:///etc/passwd")
+            .expect_err("expected non-http url to fail in hardened mode");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_reveal_missing_path() {
+        let err = webbrowser::reveal(std::path::Path::new("/webbrowser-test/no-such-path"))
+            .expect_err("expected a missing path to fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_open_with_missing_app() {
+        let err = webbrowser::open_with_app("webbrowser-test-no-such-app", "https://github.com")
+            .expect_err("expected a missing application to fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_open_with_app_finds_a_path_a_bundle_id_and_a_name() {
+        let mut options = webbrowser::BrowserOptions::new();
+        options.with_dry_run(true);
+        for app in ["/Applications/Safari.app", "com.apple.Safari", "Safari"] {
+            let opened =
+                webbrowser::open_with_app_with_options(app, "https://github.com", &options);
+            assert!(opened.is_ok(), "{app}: {opened:?}");
+        }
     }
 }

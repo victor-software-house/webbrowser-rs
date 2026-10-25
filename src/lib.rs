@@ -340,6 +340,60 @@ pub fn open_browser_with_options(
     }
 }
 
+/// Opens the URL with the application `app`, on macOS only: the path of a `.app` bundle, else a
+/// bundle identifier such as `org.mozilla.firefox`, else the name of one of the applications that
+/// open the URL, such as `Firefox`. A name that two of those applications share is refused with
+/// `ErrorKind::InvalidInput`. Return semantics are otherwise the same as for
+/// [open](fn.open.html).
+///
+/// # Examples
+/// ```no_run
+/// # #[cfg(target_os = "macos")] {
+/// if webbrowser::open_with_app("Firefox", "http://github.com").is_ok() {
+///     // ...
+/// }
+/// # }
+/// ```
+#[cfg(target_os = "macos")]
+pub fn open_with_app(app: &str, url: &str) -> Result<()> {
+    open_with_app_with_options(app, url, &BrowserOptions::default())
+}
+
+/// Opens the URL with the application `app` as [open_with_app](fn.open_with_app.html) does,
+/// while overriding the default options. With `dry_run`, it finds the application and opens
+/// nothing.
+#[cfg(target_os = "macos")]
+pub fn open_with_app_with_options(app: &str, url: &str, options: &BrowserOptions) -> Result<()> {
+    let target = TargetType::try_from(url)?;
+
+    // if feature:hardened is enabled, make sure we accept only HTTP(S) URLs
+    #[cfg(feature = "hardened")]
+    if !target.is_http() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "only http/https urls allowed",
+        ));
+    }
+
+    os::open_with_app_internal(app, &target, options)
+}
+
+/// Shows the existing file or folder at `path` selected in a Finder window, on macOS only. A
+/// path that does not exist is refused with `ErrorKind::NotFound`.
+///
+/// # Examples
+/// ```no_run
+/// # #[cfg(target_os = "macos")] {
+/// if webbrowser::reveal(std::path::Path::new("Cargo.toml")).is_ok() {
+///     // ...
+/// }
+/// # }
+/// ```
+#[cfg(target_os = "macos")]
+pub fn reveal(path: &std::path::Path) -> Result<()> {
+    os::reveal_internal(path)
+}
+
 /// The link we're trying to open, represented as a URL. Local files get represented
 /// via `file://...` URLs
 struct TargetType(url::Url);

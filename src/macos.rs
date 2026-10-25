@@ -1,11 +1,11 @@
 use crate::{Browser, BrowserOptions, Error, ErrorKind, Result, TargetType};
+use objc2::rc::Retained;
 use objc2_app_kit::{NSWorkspace, NSWorkspaceLaunchOptions};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSString, NSURL};
+use std::fmt::Display;
+use std::path::Path;
 
 /// Deal with opening of browsers on macOS using the AppKit `NSWorkspace` APIs.
-// We intentionally use the deprecated synchronous launch API (see the note at
-// the launch site below), so silence the deprecation warnings for this fn.
-#[allow(deprecated)]
 pub(super) fn open_browser_internal(
     browser: Browser,
     target: &TargetType,
@@ -27,6 +27,84 @@ pub(super) fn open_browser_internal(
         }
     }
     .ok_or_else(|| Error::new(ErrorKind::NotFound, "browser not found"))?;
+
+    launch(&workspace, &app_url, &browser, target, options)
+}
+
+/// Opens `target` with the application `app`: the path of a `.app` bundle,
+/// else a bundle identifier, else the name of one of the applications that
+/// open `target`. A name that two of those applications share is refused.
+pub(super) fn open_with_app_internal(
+    app: &str,
+    target: &TargetType,
+    options: &BrowserOptions,
+) -> Result<()> {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let app_url = resolve_app(&workspace, app, target)?;
+    launch(&workspace, &app_url, &app, target, options)
+}
+
+/// Shows `path`, an existing file or folder, selected in a Finder window.
+pub(super) fn reveal_internal(path: &Path) -> Result<()> {
+    std::fs::metadata(path)?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "path is not valid unicode"))?;
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+    NSWorkspace::sharedWorkspace()
+        .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
+    Ok(())
+}
+
+/// The application `app` names, tried in the order [`open_with_app_internal`]
+/// documents.
+fn resolve_app(workspace: &NSWorkspace, app: &str, target: &TargetType) -> Result<Retained<NSURL>> {
+    if app.ends_with(".app") && Path::new(app).is_dir() {
+        return Ok(NSURL::fileURLWithPath(&NSString::from_str(app)));
+    }
+    if let Some(url) = workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(app)) {
+        return Ok(url);
+    }
+    let target_url = NSURL::URLWithString(&NSString::from_str(target.as_ref()))
+        .ok_or_else(|| Error::other("failed to create target NSURL"))?;
+    let bundle = format!("{app}.app");
+    let mut named = workspace
+        .URLsForApplicationsToOpenURL(&target_url)
+        .to_vec()
+        .into_iter()
+        .filter(|url| {
+            url.path().is_some_and(|path| {
+                Path::new(&path.to_string())
+                    .file_name()
+                    .is_some_and(|name| name == bundle.as_str())
+            })
+        });
+    match (named.next(), named.next()) {
+        (Some(url), None) => Ok(url),
+        (None, _) => Err(Error::new(
+            ErrorKind::NotFound,
+            format!("no application {app} opens {target}"),
+        )),
+        (Some(_), Some(_)) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("more than one application is named {app}"),
+        )),
+    }
+}
+
+/// Opens `target` with the application at `app_url`, which `label` names in
+/// logs.
+// We intentionally use the deprecated synchronous launch API (see the note at
+// the launch site below), so silence the deprecation warnings for this fn.
+#[allow(deprecated)]
+fn launch(
+    workspace: &NSWorkspace,
+    app_url: &NSURL,
+    label: &dyn Display,
+    target: &TargetType,
+    options: &BrowserOptions,
+) -> Result<()> {
+    let browser = label;
 
     // handle dry-run scenario: the application was located above, so we know it
     // exists without actually launching it.
@@ -59,7 +137,7 @@ pub(super) fn open_browser_internal(
     let result = unsafe {
         workspace.openURLs_withApplicationAtURL_options_configuration_error(
             &urls,
-            &app_url,
+            app_url,
             launch_options,
             &config,
         )
