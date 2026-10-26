@@ -125,4 +125,13 @@ mod tests {
             assert!(opened.is_ok(), "{app}: {opened:?}");
         }
     }
+
+    #[test]
+    fn test_open_with_app_finds_a_name_that_opens_no_url() {
+        let mut options = webbrowser::BrowserOptions::new();
+        options.with_dry_run(true);
+        let opened =
+            webbrowser::open_with_app_with_options("Calculator", "https://github.com", &options);
+        assert!(opened.is_ok(), "{opened:?}");
+    }
 }

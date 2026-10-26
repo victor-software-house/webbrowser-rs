@@ -341,10 +341,11 @@ pub fn open_browser_with_options(
 }
 
 /// Opens the URL with the application `app`, on macOS only: the path of a `.app` bundle, else a
-/// bundle identifier such as `org.mozilla.firefox`, else the name of one of the applications that
-/// open the URL, such as `Firefox`. A name that two of those applications share is refused with
-/// `ErrorKind::InvalidInput`. Return semantics are otherwise the same as for
-/// [open](fn.open.html).
+/// bundle identifier such as `org.mozilla.firefox`, else a name such as `Firefox`, the bundle's
+/// file name without `.app`. A name is looked for first among the applications that open the URL,
+/// then in the standard application folders and one folder down, then through Spotlight when that
+/// scan finds none. A name that two applications share is refused with `ErrorKind::InvalidInput`,
+/// naming both. Return semantics are otherwise the same as for [open](fn.open.html).
 ///
 /// # Examples
 /// ```no_run

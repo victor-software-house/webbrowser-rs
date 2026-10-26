@@ -32,6 +32,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSArray",
     "NSDictionary",
     "NSError",
+    "NSFileManager",
+    "NSPathUtilities",
     "NSString",
     "NSURL",
 ] }
@@ -39,6 +41,16 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSWorkspace",
     "NSRunningApplication",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFString",
+] }
+objc2-core-services = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "Metadata",
+    "MDItem",
+    "MDQuery",
 ] }
 
 [target.'cfg(target_os = "android")'.dependencies]

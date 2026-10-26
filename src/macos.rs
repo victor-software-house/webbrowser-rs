@@ -1,9 +1,14 @@
 use crate::{Browser, BrowserOptions, Error, ErrorKind, Result, TargetType};
 use objc2::rc::Retained;
 use objc2_app_kit::{NSWorkspace, NSWorkspaceLaunchOptions};
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSString, NSURL};
+use objc2_core_foundation::{CFOptionFlags, CFString};
+use objc2_core_services::{kMDItemPath, MDItem, MDQuery, MDQueryOptionFlags};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSFileManager, NSSearchPathDirectory, NSSearchPathDomainMask,
+    NSString, NSURL,
+};
 use std::fmt::Display;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Deal with opening of browsers on macOS using the AppKit `NSWorkspace` APIs.
 pub(super) fn open_browser_internal(
@@ -32,8 +37,7 @@ pub(super) fn open_browser_internal(
 }
 
 /// Opens `target` with the application `app`: the path of a `.app` bundle,
-/// else a bundle identifier, else the name of one of the applications that
-/// open `target`. A name that two of those applications share is refused.
+/// else a bundle identifier, else a name, as [`resolve_app`] finds it.
 pub(super) fn open_with_app_internal(
     app: &str,
     target: &TargetType,
@@ -56,8 +60,17 @@ pub(super) fn reveal_internal(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The application `app` names, tried in the order [`open_with_app_internal`]
-/// documents.
+/// The application `app` names, tried in this order:
+///
+/// 1. the path of a `.app` bundle;
+/// 2. a bundle identifier, through Launch Services;
+/// 3. a name, the bundle's file name without `.app`: first among the
+///    applications that open `target`, then by a scan of the standard
+///    application folders ([`scan_app_folders`]), then through Spotlight
+///    ([`spotlight_apps`]) when the scan finds none.
+///
+/// The first step of 3 that finds the name decides it, and a name that two
+/// applications of that step share is refused, with both paths.
 fn resolve_app(workspace: &NSWorkspace, app: &str, target: &TargetType) -> Result<Retained<NSURL>> {
     if app.ends_with(".app") && Path::new(app).is_dir() {
         return Ok(NSURL::fileURLWithPath(&NSString::from_str(app)));
@@ -68,28 +81,153 @@ fn resolve_app(workspace: &NSWorkspace, app: &str, target: &TargetType) -> Resul
     let target_url = NSURL::URLWithString(&NSString::from_str(target.as_ref()))
         .ok_or_else(|| Error::other("failed to create target NSURL"))?;
     let bundle = format!("{app}.app");
-    let mut named = workspace
+    let mut found: Vec<PathBuf> = workspace
         .URLsForApplicationsToOpenURL(&target_url)
         .to_vec()
         .into_iter()
-        .filter(|url| {
-            url.path().is_some_and(|path| {
-                Path::new(&path.to_string())
-                    .file_name()
-                    .is_some_and(|name| name == bundle.as_str())
-            })
-        });
-    match (named.next(), named.next()) {
-        (Some(url), None) => Ok(url),
-        (None, _) => Err(Error::new(
-            ErrorKind::NotFound,
-            format!("no application {app} opens {target}"),
-        )),
-        (Some(_), Some(_)) => Err(Error::new(
-            ErrorKind::InvalidInput,
-            format!("more than one application is named {app}"),
-        )),
+        .filter_map(|url| url.path())
+        .map(|path| PathBuf::from(path.to_string()))
+        .filter(|path| path.file_name().is_some_and(|name| name == bundle.as_str()))
+        .collect();
+    if found.is_empty() {
+        found = scan_app_folders(&app_folders(), &bundle);
     }
+    if found.is_empty() {
+        found = spotlight_apps(&bundle)?;
+    }
+    let path = pick(app, found)?;
+    Ok(NSURL::fileURLWithPath(&NSString::from_str(
+        &path.to_string_lossy(),
+    )))
+}
+
+/// The one path in `found`, or an error: `NotFound` when it is empty, and
+/// `InvalidInput`, naming every path, when two differ.
+///
+/// Each path is first resolved through its symbolic links, so one bundle
+/// reached by two paths counts once: `/Applications/Safari.app` links to the
+/// copy under `/System/Cryptexes`. A path that cannot be resolved stays as it
+/// is.
+fn pick(app: &str, found: Vec<PathBuf>) -> Result<PathBuf> {
+    let mut found: Vec<PathBuf> = found
+        .into_iter()
+        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+        .collect();
+    found.sort();
+    found.dedup();
+    match found.len() {
+        0 => Err(Error::new(
+            ErrorKind::NotFound,
+            format!("no application is named {app}"),
+        )),
+        1 => Ok(found.remove(0)),
+        _ => {
+            let paths: Vec<String> = found
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "more than one application is named {app}: {}",
+                    paths.join(", ")
+                ),
+            ))
+        }
+    }
+}
+
+/// The standard application folders of every domain, as the system lists
+/// them, such as `/Applications` and `~/Applications`.
+fn app_folders() -> Vec<PathBuf> {
+    NSFileManager::defaultManager()
+        .URLsForDirectory_inDomains(
+            NSSearchPathDirectory::ApplicationDirectory,
+            NSSearchPathDomainMask::AllDomainsMask,
+        )
+        .to_vec()
+        .into_iter()
+        .filter_map(|url| url.path())
+        .map(|path| PathBuf::from(path.to_string()))
+        .collect()
+}
+
+/// Every bundle named `bundle` in `folders` or one folder down, such as
+/// `/Applications/Utilities`. A folder that cannot be read is skipped, and
+/// nothing inside a `.app` bundle is read.
+fn scan_app_folders(folders: &[PathBuf], bundle: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for folder in folders {
+        for path in entries(folder) {
+            if path.file_name().is_some_and(|name| name == bundle) {
+                found.push(path);
+            } else if path.extension().is_none_or(|ext| ext != "app") && path.is_dir() {
+                found.extend(
+                    entries(&path)
+                        .filter(|nested| nested.file_name().is_some_and(|name| name == bundle)),
+                );
+            }
+        }
+    }
+    found
+}
+
+/// The paths in `folder`, or none when it cannot be read.
+fn entries(folder: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+}
+
+/// Every application bundle named `bundle` that Spotlight has indexed,
+/// through a synchronous `MDQuery`, which needs no run loop.
+fn spotlight_apps(bundle: &str) -> Result<Vec<PathBuf>> {
+    let mut name = String::with_capacity(bundle.len());
+    for c in bundle.chars() {
+        // A query string quotes its value; `*` in a value is a wildcard.
+        if matches!(c, '\\' | '"' | '*') {
+            name.push('\\');
+        }
+        name.push(c);
+    }
+    let expression = CFString::from_str(&format!(
+        "kMDItemContentType == \"com.apple.application-bundle\" && kMDItemFSName == \"{name}\""
+    ));
+    // SAFETY: the default allocator, a query string, and no value-list or
+    // sorting attributes, all of which `MDQueryCreate` accepts as NULL.
+    let query = unsafe { MDQuery::new(None, Some(&*expression), None, None) }
+        .ok_or_else(|| Error::other("failed to create the Spotlight query"))?;
+    // SAFETY: a query created above and not yet executed.
+    let executed = unsafe { query.execute(MDQueryOptionFlags::Synchronous.0 as CFOptionFlags) };
+    if !executed {
+        return Err(Error::other("the Spotlight query failed"));
+    }
+    // SAFETY: an immutable constant of the Metadata framework.
+    let path_key =
+        unsafe { kMDItemPath }.ok_or_else(|| Error::other("kMDItemPath is not defined"))?;
+    let mut found = Vec::new();
+    // SAFETY: a synchronous query no longer changes its results, so each
+    // index below the count holds an `MDItem`.
+    let count = unsafe { query.result_count() };
+    for index in 0..count {
+        let item = unsafe { query.result_at_index(index) }.cast::<MDItem>();
+        let Some(item) = (unsafe { item.as_ref() }) else {
+            continue;
+        };
+        let path = unsafe { item.attribute(Some(path_key)) };
+        if let Some(path) = path
+            .as_deref()
+            .and_then(|value| value.downcast_ref::<CFString>())
+        {
+            let path = PathBuf::from(path.to_string());
+            if path.file_name().is_some_and(|name| name == bundle) {
+                found.push(path);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Opens `target` with the application at `app_url`, which `label` names in
@@ -229,5 +367,109 @@ mod tests {
         let _ = env_logger::try_init();
         assert!(Browser::Safari.exists());
         assert!(!Browser::Opera.exists());
+    }
+
+    #[test]
+    fn test_scan_finds_a_bundle_at_the_top_and_one_folder_down() {
+        let root = std::env::temp_dir().join(format!("webbrowser-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [
+            "Twice.app",
+            "Vendor/Twice.app",
+            "Other.app/Twice.app",
+            "a/b/Twice.app",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).expect("failed to create a test bundle");
+        }
+        let mut found = scan_app_folders(std::slice::from_ref(&root), "Twice.app");
+        found.sort();
+        std::fs::remove_dir_all(&root).expect("failed to remove the test folder");
+        assert_eq!(
+            found,
+            [root.join("Twice.app"), root.join("Vendor/Twice.app")]
+        );
+    }
+
+    #[test]
+    fn test_a_bundle_reached_through_a_symlink_counts_once() {
+        let root = std::env::temp_dir().join(format!("webbrowser-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundle = root.join("System/Twice.app");
+        std::fs::create_dir_all(&bundle).expect("failed to create a test bundle");
+        std::os::unix::fs::symlink(&bundle, root.join("Twice.app"))
+            .expect("failed to link the test bundle");
+        let found = scan_app_folders(std::slice::from_ref(&root), "Twice.app");
+        let count = found.len();
+        let picked = pick("Twice", found);
+        let expected = std::fs::canonicalize(bundle);
+        std::fs::remove_dir_all(root).expect("failed to remove the test folder");
+        assert_eq!(count, 2);
+        assert_eq!(
+            picked.expect("expected one application"),
+            expected.expect("failed to resolve the test bundle")
+        );
+    }
+
+    #[test]
+    fn test_a_shared_name_is_refused_with_every_path() {
+        let found = vec![
+            PathBuf::from("/b/Twice.app"),
+            PathBuf::from("/a/Twice.app"),
+            PathBuf::from("/b/Twice.app"),
+        ];
+        let err = pick("Twice", found).expect_err("expected a shared name to be refused");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "more than one application is named Twice: /a/Twice.app, /b/Twice.app"
+        );
+    }
+
+    #[test]
+    fn test_spotlight_finds_only_the_bundle_it_was_asked_for() {
+        let found = spotlight_apps("Safari.app").expect("failed to run the Spotlight query");
+        assert!(
+            found.iter().all(|path| path.ends_with("Safari.app")),
+            "{found:?}"
+        );
+        let missing = spotlight_apps("webbrowser-test-no-such-app.app")
+            .expect("failed to run the Spotlight query");
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    /// Times one lookup on its own, for the benchmark of the two: its first
+    /// call in this process, then the median and slowest of 20 more.
+    /// `WEBBROWSER_LOOKUP` is `scan` or `spotlight`, and
+    /// `WEBBROWSER_LOOKUP_NAME` the name to find.
+    #[test]
+    #[ignore]
+    fn lookup_timing() {
+        let lookup = std::env::var("WEBBROWSER_LOOKUP").expect("WEBBROWSER_LOOKUP is not set");
+        let name =
+            std::env::var("WEBBROWSER_LOOKUP_NAME").expect("WEBBROWSER_LOOKUP_NAME is not set");
+        let bundle = format!("{name}.app");
+        let find = || match lookup.as_str() {
+            "scan" => scan_app_folders(&app_folders(), &bundle),
+            "spotlight" => spotlight_apps(&bundle).expect("failed to run the Spotlight query"),
+            other => panic!("unknown lookup {other}"),
+        };
+        let start = std::time::Instant::now();
+        let found = find();
+        let cold = start.elapsed();
+        let mut warm: Vec<_> = (0..20)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                find();
+                start.elapsed()
+            })
+            .collect();
+        warm.sort();
+        println!(
+            "lookup={lookup} name={name} found={found:?} cold_us={} warm_p50_us={} warm_max_us={} folders={:?}",
+            cold.as_micros(),
+            warm[10].as_micros(),
+            warm[19].as_micros(),
+            app_folders(),
+        );
     }
 }
